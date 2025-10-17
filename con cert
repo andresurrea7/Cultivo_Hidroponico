@@ -1,0 +1,507 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include "DHT.h"
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+
+// =================== CONFIGURACIÓN ===================
+#define WIFI_SSID     "Diana"
+#define WIFI_PASSWORD "cursoiot"
+
+/// topicos ///
+const char* topic = "sensor/temperatura";
+const char* topic1 = "sensor/humedad_aire";
+const char* topic3 = "sensor/nivel";
+const char* topic4 = "sensor/ph";
+const char* topic5 = "sensor/humedad_raiz";
+const char* topic6 = "sensor/bomba";
+
+/// certificado ///
+const char* ca_cert = \
+"-----BEGIN CERTIFICATE-----\n" \
+"MIIEBzCCAu+gAwIBAgIUCRiHSfXmMQLIn4g2nHe8fVUwkGEwDQYJKoZIhvcNAQEL\n" \
+"BQAwgZIxCzAJBgNVBAYTAkNPMRIwEAYDVQQIDAlhbnRpb3F1aWExETAPBgNVBAcM\n" \
+"CG1lZGVsbGluMQ0wCwYDVQQKDARVZGVBMQwwCgYDVQQLDANJb1QxEzARBgNVBAMM\n" \
+"CkNBLUJyYWhpYW4xKjAoBgkqhkiG9w0BCQEWG2JyYWhpYW4uY2FycmVyYUB1ZGVh\n" \
+"LmVkdS5jbzAeFw0yNTA5MjYxOTA2MTVaFw0yNjA5MjYxOTA2MTVaMIGSMQswCQYD\n" \
+"VQQGEwJDTzESMBAGA1UECAwJYW50aW9xdWlhMREwDwYDVQQHDAhtZWRlbGxpbjEN\n" \
+"MAsGA1UECgwEVWRlQTEMMAoGA1UECwwDSW9UMRMwEQYDVQQDDApDQS1CcmFoaWFu\n" \
+"MSowKAYJKoZIhvcNAQkBFhticmFoaWFuLmNhcnJlcmFAdWRlYS5lZHUuY28wggEi\n" \
+"MA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDSCX83rrmIfT1gxvP5st7SURkd\n" \
+"Pm6IV3drN/FGMakMrpr/np/yCPWK61F34b+MZXLPZZd6v9S6uAyu/3RtuAFPczDW\n" \
+"XTPyP5tdHSZRjznE/EAirdr5eCC3JxtGfVaQZaDFbefQlqX+yMNGF0Yp6hgqowsX\n" \
+"FPo2O9QDNwS7bI0pGks9bZJZEkJDpTbZ3IFUw1JntKPGzF8r6TDDZ1D/vSuQlFST\n" \
+"COhapSoO3ofDUTjjQMsQZV8Atha0/h/nkpJE5t0aveY36A8WBlGxjjYGBb2/Xga8\n" \
+"cOExdo1VeKjUK2tBTQjE1ITA/qmuVelb68j2DUidxwdENz+0lHJihr0hE9rtAgMB\n" \
+"AAGjUzBRMB0GA1UdDgQWBBQjyWLgoiVNqA+1MgRECAWO1TxXZTAfBgNVHSMEGDAW\n" \
+"gBQjyWLgoiVNqA+1MgRECAWO1TxXZTAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3\n" \
+"DQEBCwUAA4IBAQA10n0rTycZ05Lx/0AMzeah8f5zZJBC/Dp+r3ccKIus+34oJoHn\n" \
+"3SJprOETDw/heKRm1IccMnif6n4A8hS29jixmWpDfhDwpJoUVZOViVOWKwuN+CU4\n" \
+"dvYGP25bzR91Zt6pcqxibUcPUEbyM4MwTMWb2+cj+h2JitbwapmNqUTseQLURUcz\n" \
+"gtyd/Ov33VoSRpIEqcMp2yA32c3FLoPcSkIGO+uPACp7BqJCSxx1bUSI9LJy+4cW\n" \
+"6mNx09PmSMWXif/pyFLtwCHWbWWCLKMwzeT1zToAl8gJWL0tlBAMp6cHMaKHcmxS\n" \
+"ZRnhK9tSAQx2u8tC+KL1XP1qu+iJ3taVMwTi\n" \
+"-----END CERTIFICATE-----\n";
+
+// IP del broker Mosquitto en la Raspberry Pi
+const char* mqtt_server = "sofia.local";
+const int mqtt_port = 8883;
+
+WiFiClientSecure espClient;
+PubSubClient client(espClient);
+
+// Pines sensores y actuadores
+#define PH_PIN            33
+#define SOIL_PIN          32
+#define LED_WIFI_PIN      12
+#define DHT_PIN           4
+#define NIVEL_PIN         17
+#define RELAY_BOMBA       18
+#define RELAY_VALVULA     5
+
+// DHT
+#define DHTTYPE DHT22
+DHT dht(DHT_PIN, DHTTYPE);
+
+// =================== RTOS ===================
+#define RTOS_DELAY(ms) vTaskDelay((ms) / portTICK_PERIOD_MS)
+
+TaskHandle_t TaskSensorsHandle = NULL;
+TaskHandle_t TaskRiegoHandle   = NULL;
+TaskHandle_t TaskWifiHandle    = NULL;
+
+// =================== WIFI + NTP ===================
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "time.nist.gov", -5 * 3600, 60000);
+
+// =================== VARIABLES GLOBALES ===================
+// Variables atómicas para compartir entre tareas
+volatile float lastPH = 0.0;
+volatile int lastSoil = 0;
+volatile float lastTemp = 0.0;
+volatile float lastHum = 0.0;
+volatile bool nivelAguaOK = false;
+volatile bool wifiConectado = false;
+
+// Control de sistema
+volatile bool cicloActivo = false;
+volatile unsigned long cicloStart = 0;
+volatile bool bombaEncendida = false;
+volatile bool llenandoTanque = false;
+volatile bool medicionNivelRealizada = false;
+volatile bool primerArranque = true;
+
+// Control de tiempo MEJORADO
+volatile unsigned long ultimaHoraSincronizada = 0;  // Timestamp de la última sincronización
+volatile unsigned long tiempoBaseSincronizado = 0;  // Tiempo base basado en la última hora real
+volatile int ultimaHora = 7;                        // Última hora conocida (por defecto 7:00 AM)
+volatile int ultimoMinuto = 0;
+volatile int ultimoSegundo = 0;
+volatile bool horaSincronizada = false;
+
+// Configuraciones del usuario
+volatile unsigned long TIEMPO_RIEGO = 3 * 60 * 1000;
+volatile unsigned long TIEMPO_DESCANSO = 5 * 60 * 1000;
+volatile int HORA_INICIO_RIEGO = 7;
+volatile int HORA_FIN_RIEGO = 17;
+volatile int HORA_INICIO_LLENADO = 18;
+volatile int HORA_FIN_LLENADO = 6;
+volatile bool MEDIR_PH = true;
+
+// sensor de humedad del suelo
+volatile int SOIL_WET_VALUE = 1200;    // Valor cuando está en agua (muy húmedo)
+volatile int SOIL_DRY_VALUE = 4095;    // Valor cuando está completamente seco
+volatile int lastSoilPercent = 0;
+
+// =================== TAREAS ===================
+
+// Función para formatear hora con dos dígitos
+String formatTime(int hours, int minutes, int seconds) {
+  String h = hours < 10 ? "0" + String(hours) : String(hours);
+  String m = minutes < 10 ? "0" + String(minutes) : String(minutes);
+  String s = seconds < 10 ? "0" + String(seconds) : String(seconds);
+  return h + ":" + m + ":" + s;
+}
+
+// Función para obtener hora actual (con o sin WiFi)
+void obtenerHoraActual(int &hora, int &minuto, int &segundo) {
+  if (wifiConectado && horaSincronizada) {
+    // Usar hora NTP sincronizada
+    timeClient.update();
+    hora = timeClient.getHours();
+    minuto = timeClient.getMinutes();
+    segundo = timeClient.getSeconds();
+    
+    // Actualizar última hora conocida
+    ultimaHora = hora;
+    ultimoMinuto = minuto;
+    ultimoSegundo = segundo;
+    ultimaHoraSincronizada = millis();
+  } else {
+    // Calcular hora basada en la última sincronización
+    unsigned long tiempoTranscurrido = millis() - ultimaHoraSincronizada;
+    unsigned long segundosTotales = (ultimaHora * 3600UL) + (ultimoMinuto * 60UL) + ultimoSegundo;
+    segundosTotales += (tiempoTranscurrido / 1000);
+    
+    hora = (segundosTotales / 3600) % 24;
+    minuto = (segundosTotales % 3600) / 60;
+    segundo = segundosTotales % 60;
+  }
+}
+
+// --- Tarea de Sensores ---
+void SensoresTask(void *pvParameters) {
+  (void) pvParameters;
+
+  pinMode(PH_PIN, INPUT);
+  pinMode(SOIL_PIN, INPUT);
+  pinMode(NIVEL_PIN, INPUT_PULLUP);
+
+  dht.begin();
+  
+  RTOS_DELAY(2000);
+
+  Serial.println("[Sensores] Tarea de sensores iniciada");
+
+  for (;;) {
+    // Leer sensor de nivel
+    bool nivelLeido = (digitalRead(NIVEL_PIN) == LOW);
+    if (nivelLeido != nivelAguaOK) {
+      nivelAguaOK = nivelLeido;
+      Serial.printf("[Sensores] Cambio en nivel de agua: %s\n", nivelAguaOK ? "OK" : "BAJO");
+    }
+
+    // Leer humedad suelo
+    int soilRaw = analogRead(SOIL_PIN);
+    
+    // Para sistemas con alta humedad, ajustamos el mapeo
+    // 0% = completamente seco, 100% = completamente sumergido en agua
+    int soilPercent = map(soilRaw, SOIL_DRY_VALUE, SOIL_WET_VALUE, 0, 100);
+    soilPercent = constrain(soilPercent, 0, 100);
+    
+    // En sistemas hidropónicos, valores altos son normales
+    if (soilPercent != lastSoilPercent) {
+        lastSoilPercent = soilPercent;
+        lastSoil = soilRaw; // Guardar valor crudo también
+    }
+
+    // Leer DHT22
+    float temp = dht.readTemperature();
+    float hum = dht.readHumidity();
+    
+    if (!isnan(temp) && temp != lastTemp) {
+      lastTemp = temp;
+    }
+    if (!isnan(hum) && hum != lastHum) {
+      lastHum = hum;
+    }
+
+    // Leer pH
+    if (MEDIR_PH) {
+      int phRaw = analogRead(PH_PIN);
+      float voltage = phRaw * (3.3 / 4095.0);
+      float phCalculado = 7.0 + ((voltage - 2.5) / 0.18);
+      if (phCalculado != lastPH) {
+        lastPH = phCalculado;
+      }
+    }
+
+    // Debug cada 5 segundos
+    static unsigned long lastPrint = 0;
+    if (millis() - lastPrint > 5000) {
+      lastPrint = millis();
+      
+      int hora, minuto, segundo;
+      obtenerHoraActual(hora, minuto, segundo);
+      String timestamp = formatTime(hora, minuto, segundo);
+      
+      String modo = wifiConectado ? "" : " [EMERGENCIA]";
+      Serial.printf("[%s] pH=%.2f, Humedad=%d%%, Temp=%.1f°C, HumAire=%.1f%%, Nivel=%s%s\n",
+              timestamp.c_str(), lastPH, lastSoilPercent, 
+              lastTemp, lastHum, nivelAguaOK ? "OK" : "BAJO", modo.c_str());
+    }
+
+    RTOS_DELAY(1000);
+  }
+}
+
+
+
+
+// --- Tarea de Riego ---
+void RiegoTask(void *pvParameters) {
+  (void) pvParameters;
+
+  pinMode(RELAY_BOMBA, OUTPUT);
+  pinMode(RELAY_VALVULA, OUTPUT);
+
+  digitalWrite(RELAY_BOMBA, HIGH);
+  digitalWrite(RELAY_VALVULA, HIGH);
+
+  Serial.println("[Riego] Tarea de riego iniciada");
+
+  for (;;) {
+    // Obtener hora actual
+    int horaActual, minutoActual, segundoActual;
+    obtenerHoraActual(horaActual, minutoActual, segundoActual);
+    String timestamp = formatTime(horaActual, minutoActual, segundoActual);
+
+    // === CONTROL DE NIVEL DE AGUA ===
+    bool dentroHorarioLlenado = (horaActual >= HORA_INICIO_LLENADO || horaActual < HORA_FIN_LLENADO);
+
+    // Solo llenar si estamos en horario de llenado Y el nivel está bajo
+    if (dentroHorarioLlenado && !nivelAguaOK && !llenandoTanque) {
+      Serial.printf("[Riego %s] Iniciando llenado automático - Nivel bajo\n", timestamp.c_str());
+      llenandoTanque = true;
+      digitalWrite(RELAY_VALVULA, LOW);
+    }
+    
+    // Detener llenado si el nivel está OK o fuera de horario
+    if (llenandoTanque && (nivelAguaOK || !dentroHorarioLlenado)) {
+      if (nivelAguaOK) {
+        Serial.printf("[Riego %s] Tanque LLENO, cerrando válvula\n", timestamp.c_str());
+      } else {
+        Serial.printf("[Riego %s] Fuera de horario de llenado, cerrando válvula\n", timestamp.c_str());
+      }
+      digitalWrite(RELAY_VALVULA, HIGH);
+      llenandoTanque = false;
+    }
+
+    // No regar mientras se llena el tanque
+    if (llenandoTanque) {
+      RTOS_DELAY(1000);
+      continue;
+    }
+
+    // === SISTEMA DE RIEGO PRINCIPAL ===
+    bool dentroHorarioRiego = (horaActual >= HORA_INICIO_RIEGO && horaActual < HORA_FIN_RIEGO);
+    
+    if (dentroHorarioRiego) {
+      if (!cicloActivo) {
+        cicloActivo = true;
+        bombaEncendida = true;
+        cicloStart = millis();
+        digitalWrite(RELAY_BOMBA, LOW);
+        Serial.printf("[Riego %s] Bomba ENCENDIDA - Ciclo de %lu min\n", 
+                     timestamp.c_str(), TIEMPO_RIEGO/60000);
+      } else {
+        unsigned long tiempoTranscurrido = millis() - cicloStart;
+        
+        if (bombaEncendida && tiempoTranscurrido >= TIEMPO_RIEGO) {
+          bombaEncendida = false;
+          cicloStart = millis();
+          digitalWrite(RELAY_BOMBA, HIGH);
+          Serial.printf("[Riego %s] Bomba APAGADA - Descanso de %lu min\n", 
+                       timestamp.c_str(), TIEMPO_DESCANSO/60000);
+        } else if (!bombaEncendida && tiempoTranscurrido >= TIEMPO_DESCANSO) {
+          bombaEncendida = true;
+          cicloStart = millis();
+          digitalWrite(RELAY_BOMBA, LOW);
+          Serial.printf("[Riego %s] Bomba ENCENDIDA - Ciclo de %lu min\n", 
+                       timestamp.c_str(), TIEMPO_RIEGO/60000);
+        }
+      }
+    } else {
+      if (cicloActivo || bombaEncendida) {
+        cicloActivo = false;
+        bombaEncendida = false;
+        digitalWrite(RELAY_BOMBA, HIGH);
+        Serial.printf("[Riego %s] Riego DETENIDO - %s\n", timestamp.c_str(),
+                     !nivelAguaOK ? "Nivel bajo" : "Fuera de horario");
+      }
+    }
+
+    RTOS_DELAY(1000);
+  }
+}
+
+// --- Tarea WiFi + NTP ---
+void WifiTask(void *pvParameters) {
+  (void) pvParameters;
+
+  pinMode(LED_WIFI_PIN, OUTPUT);
+  digitalWrite(LED_WIFI_PIN, LOW);
+
+  Serial.println("[WiFi] Iniciando conexión...");
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  
+  bool conectado = false;
+  unsigned long lastReconnectAttempt = 0;
+  const unsigned long RECONNECT_INTERVAL = 30000;
+
+  for (;;) {
+    if (WiFi.status() == WL_CONNECTED) {
+      if (!conectado) {
+        conectado = true;
+        wifiConectado = true;
+        digitalWrite(LED_WIFI_PIN, HIGH);
+        Serial.println("[WiFi] Conectado!");
+        Serial.print("[WiFi] IP: ");
+        Serial.println(WiFi.localIP());
+        
+        timeClient.begin();
+        timeClient.forceUpdate();
+        RTOS_DELAY(1000);
+        
+        // SINCRONIZAR HORA POR PRIMERA VEZ
+        timeClient.update();
+        ultimaHora = timeClient.getHours();
+        ultimoMinuto = timeClient.getMinutes();
+        ultimoSegundo = timeClient.getSeconds();
+        ultimaHoraSincronizada = millis();
+        horaSincronizada = true;
+        
+        Serial.printf("[NTP] Hora sincronizada: %s\n", 
+                     formatTime(ultimaHora, ultimoMinuto, ultimoSegundo).c_str());
+      }
+      
+      // Mantener sincronización periódica
+      timeClient.update();
+      digitalWrite(LED_WIFI_PIN, HIGH);
+      
+    } else {
+      if (conectado) {
+        conectado = false;
+        wifiConectado = false;
+        Serial.println("[WiFi] Desconectado! Continuando con última hora conocida");
+        Serial.printf("[WiFi] Última hora: %s\n", 
+                     formatTime(ultimaHora, ultimoMinuto, ultimoSegundo).c_str());
+      }
+      
+      digitalWrite(LED_WIFI_PIN, (millis() % 2000 < 1000) ? HIGH : LOW);
+      
+      if (millis() - lastReconnectAttempt > RECONNECT_INTERVAL) {
+        Serial.println("[WiFi] Intentando reconectar...");
+        WiFi.disconnect();
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+        lastReconnectAttempt = millis();
+      }
+    }
+
+    RTOS_DELAY(1000);
+  }
+}
+
+
+
+// =================== FUNCIONES AUXILIARES ===================
+TaskHandle_t TaskMQTTHandle = NULL;
+
+void MQTTTask(void *pvParameters) {
+
+  
+  (void) pvParameters;
+
+
+  for (;;) {
+    if (!wifiConectado) {
+      RTOS_DELAY(5000);
+      continue;
+    }
+
+    if (!client.connected()) {
+    while(!client.connected()) {
+    Serial.print("Conectando al broker MQTT...");
+    if (client.connect("ESP32Client")) {
+    Serial.println("Conectado");
+    } else {
+    Serial.print("Fallo, rc=");
+    Serial.print(client.state());
+    Serial.println(" Reintentando en 5 segundos...");
+    delay(5000);
+    }
+}
+    }
+
+    client.loop();
+
+    // Publicar temperatura
+    char tempStr[10];
+    dtostrf(lastTemp, 4, 2, tempStr);
+    client.publish(topic, tempStr);
+
+    // Publicar humedad del aire
+    char humStr[10];
+    dtostrf(lastHum, 4, 2, humStr);
+    client.publish(topic1, humStr);
+
+    // Publicar nivel de agua
+    client.publish(topic3, nivelAguaOK ? "1" : "0");
+
+    // Publicar pH
+    char phStr[10];
+    dtostrf(lastPH, 4, 2, phStr);
+    client.publish(topic4, phStr);
+
+    // Publicar humedad del suelo
+    char soilStr[10];
+    itoa(lastSoilPercent, soilStr, 10);
+    client.publish(topic5, soilStr);
+
+    // Publicar estado de la bomba
+    client.publish(topic6, bombaEncendida ? "1" : "0");
+
+    // Esperar 10 segundos entre publicaciones
+    RTOS_DELAY(10000);
+  }
+}
+
+
+
+void mostrarEstadoSistema() {
+  int horaActual, minutoActual, segundoActual;
+  obtenerHoraActual(horaActual, minutoActual, segundoActual);
+  String timestamp = formatTime(horaActual, minutoActual, segundoActual);
+  
+  Serial.println("\n=== ESTADO DEL SISTEMA [" + timestamp + "] ===");
+  Serial.printf("WiFi: %s\n", wifiConectado ? "CONECTADO" : "DESCONECTADO");
+  Serial.printf("Hora Sincronizada: %s\n", horaSincronizada ? "SI" : "NO");
+  Serial.printf("Nivel agua: %s\n", nivelAguaOK ? "OK" : "BAJO");
+  Serial.printf("Llenando tanque: %s\n", llenandoTanque ? "SI" : "NO");
+  Serial.printf("Bomba riego: %s\n", bombaEncendida ? "ENCENDIDA" : "APAGADA");
+  Serial.printf("Ciclo activo: %s\n", cicloActivo ? "SI" : "NO");
+  Serial.printf("Horario riego: %d:00 - %d:00\n", HORA_INICIO_RIEGO, HORA_FIN_RIEGO);
+  Serial.printf("Horario llenado: %d:00 - %d:00\n", HORA_INICIO_LLENADO, HORA_FIN_LLENADO);
+  Serial.println("==========================\n");
+}
+
+// =================== SETUP ===================
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n=== SISTEMA DE RIEGO AUTOMÁTICO INICIADO ===");
+  Serial.println("Inicializando tareas...");
+  espClient.setCACert(ca_cert);
+  client.setServer(mqtt_server, mqtt_port);
+  
+
+  // Inicializar tiempo por defecto (7:00 AM)
+  ultimaHora = HORA_INICIO_RIEGO;
+  ultimoMinuto = 0;
+  ultimoSegundo = 0;
+  ultimaHoraSincronizada = millis();
+
+  // Crear tareas
+  xTaskCreatePinnedToCore(SensoresTask, "SensoresTask", 4096, NULL, 1, &TaskSensorsHandle, 1);
+  xTaskCreatePinnedToCore(RiegoTask, "RiegoTask", 4096, NULL, 2, &TaskRiegoHandle, 1);
+  xTaskCreatePinnedToCore(WifiTask, "WifiTask", 4096, NULL, 1, &TaskWifiHandle, 0);
+  xTaskCreatePinnedToCore(MQTTTask, "MQTTTask", 4096, NULL, 1, &TaskMQTTHandle, 1);
+
+
+  Serial.println("Tareas creadas - Sistema operativo");
+  
+  RTOS_DELAY(5000);
+  mostrarEstadoSistema();
+}
+
+void loop() {
+  static unsigned long lastStatus = 0;
+  if (millis() - lastStatus > 30000) {
+    mostrarEstadoSistema();
+    lastStatus = millis();
+  }
+  
+  RTOS_DELAY(1000);
+}
