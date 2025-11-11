@@ -5,10 +5,11 @@
 #include "DHT.h"
 #include <WiFiClientSecure.h>
 #include <UniversalTelegramBot.h>
+#include <ArduinoJson.h>
 
 // =================== CONFIGURACIÓN ===================
-#define WIFI_SSID     "Poco Andres"
-#define WIFI_PASSWORD "Andres1999"
+#define WIFI_SSID     "CORAZON"
+#define WIFI_PASSWORD "21624381rmg"
 
 // Pines sensores y actuadores
 #define PH_PIN            33
@@ -25,7 +26,11 @@ DHT dht(DHT_PIN, DHTTYPE);
 
 // =================== TELEGRAM ===================
 #define BOT_TOKEN "8455839717:AAHnAR2C6LH_YLYbgEUoCTqUm8qy4YPD7C8"
-#define CHAT_ID "1595976531"
+#define CHAT_ID "7162242048"
+// Lista de usuarios autorizados
+const char* CHAT_IDS[] = {"1595976531", "7162242048"};  // agrega los que quieras
+const int NUM_CHAT_IDS = 2;  // cantidad de IDs
+
 
 WiFiClientSecure client;
 UniversalTelegramBot bot(BOT_TOKEN, client);
@@ -58,6 +63,7 @@ volatile unsigned long cicloStart = 0;
 volatile bool bombaEncendida = false;
 volatile bool llenandoTanque = false;
 volatile bool valvulaManual = false;
+volatile bool bombaManual = false;
 
 // Control de tiempo MEJORADO - SIMPLIFICADO
 volatile unsigned long ultimaHoraSincronizada = 0;
@@ -73,6 +79,9 @@ volatile int HORA_INICIO_RIEGO = 7;
 volatile int HORA_FIN_RIEGO = 17;
 volatile int HORA_INICIO_LLENADO = 18;
 volatile int HORA_FIN_LLENADO = 6;
+volatile int HORA_ext_ini1 = 21;
+volatile int HORA_ext_ini2 = 3;
+volatile int HORA_ext_ini3 = 23;
 volatile bool MEDIR_PH = true;
 
 // sensor de humedad del suelo
@@ -88,6 +97,14 @@ String formatTime(int hours, int minutes, int seconds) {
   String s = seconds < 10 ? "0" + String(seconds) : String(seconds);
   return h + ":" + m + ":" + s;
 }
+//autorización de usuarios
+bool autorizado(String id) {
+  for (int i = 0; i < NUM_CHAT_IDS; i++) {
+    if (id == CHAT_IDS[i]) return true;
+  }
+  return false;
+}
+
 
 // Función SIMPLIFICADA para obtener hora actual
 void obtenerHoraActual(int &hora, int &minuto, int &segundo) {
@@ -106,10 +123,10 @@ void obtenerHoraActual(int &hora, int &minuto, int &segundo) {
         ultimaHoraSincronizada = millis();
         horaSincronizada = true;
         
-        Serial.printf("[NTP] ✅ Hora sincronizada: %s\n", formatTime(hora, minuto, segundo).c_str());
+        Serial.printf("[NTP] Hora sincronizada: %s\n", formatTime(hora, minuto, segundo).c_str());
         return;
       } else {
-        Serial.println("[NTP] ⚠️  Falló sincronización, usando hora local");
+        Serial.println("[NTP] Falló sincronización, usando hora local");
       }
     } else {
       // Usar hora NTP ya sincronizada
@@ -205,6 +222,7 @@ void SensoresTask(void *pvParameters) {
 }
 
 // --- Tarea de Riego --- 
+// --- Tarea de Riego --- 
 void RiegoTask(void *pvParameters) {
   (void) pvParameters;
 
@@ -218,6 +236,12 @@ void RiegoTask(void *pvParameters) {
 
   unsigned long lastControlTime = 0;
 
+  // Variables para control de riegos extemporáneos
+  unsigned long inicioExtemporaneo = 0;
+  bool extemporaneoActivo = false;
+  bool extemporaneoRealizado[3] = {false, false, false};
+  const unsigned long DURACION_EXTEMPORANEO = 4 * 60 * 1000; // 4 minutos
+
   for (;;) {
     unsigned long currentMillis = millis();
     
@@ -228,6 +252,15 @@ void RiegoTask(void *pvParameters) {
       int horaActual, minutoActual, segundoActual;
       obtenerHoraActual(horaActual, minutoActual, segundoActual);
 
+      // === RESETEAR MARCAS DE RIEGOS EXTRA A MEDIA NOCHE ===
+      if (horaActual == 0 && minutoActual == 0 && segundoActual < 5) {
+        for (int i = 0; i < 3; i++) extemporaneoRealizado[i] = false;
+      }
+      // Si está en modo manual, saltar control automático
+      if (bombaManual) {
+      vTaskDelay(pdMS_TO_TICKS(2000));
+      continue;
+      }
       // === CONTROL DE VÁLVULA ===
       if (!valvulaManual) {
         bool dentroHorarioLlenado = (horaActual >= HORA_INICIO_LLENADO || horaActual < HORA_FIN_LLENADO);
@@ -245,16 +278,41 @@ void RiegoTask(void *pvParameters) {
         }
       }
 
+      // === CONTROL DE RIEGOS EXTEMPORÁNEOS ===
+      int horasExt[3] = {HORA_ext_ini1, HORA_ext_ini2, HORA_ext_ini3};
+
+      for (int i = 0; i < 3; i++) {
+        // Si estamos dentro del minuto exacto de inicio y aún no se hizo hoy
+        if (!extemporaneoRealizado[i] && horaActual == horasExt[i] && minutoActual == 0) {
+          Serial.printf("[Riego] 💦 Iniciando riego extemporáneo %d a las %02d:00\n", i+1, horasExt[i]);
+          extemporaneoActivo = true;
+          inicioExtemporaneo = currentMillis;
+          bombaEncendida = true;
+          digitalWrite(RELAY_BOMBA, LOW);
+          extemporaneoRealizado[i] = true;
+        }
+      }
+
+      // Si está activo, controlar duración de 4 minutos
+      if (extemporaneoActivo) {
+        if (currentMillis - inicioExtemporaneo >= DURACION_EXTEMPORANEO) {
+          extemporaneoActivo = false;
+          bombaEncendida = false;
+          digitalWrite(RELAY_BOMBA, HIGH);
+          Serial.println("[Riego] 💧 Riego extemporáneo finalizado");
+        }
+      }
+
       // === SISTEMA DE RIEGO PRINCIPAL ===
       bool dentroHorarioRiego = (horaActual >= HORA_INICIO_RIEGO && horaActual < HORA_FIN_RIEGO);
       
-      if (dentroHorarioRiego && !bombaEncendida) {
+      if (dentroHorarioRiego && !extemporaneoActivo) {  // Evitar conflicto
         if (!cicloActivo) {
           cicloActivo = true;
           bombaEncendida = true;
           cicloStart = currentMillis;
           digitalWrite(RELAY_BOMBA, LOW);
-          Serial.printf("[Riego] 💧 BOMBA ENCENDIDA - Ciclo %lu min ON / %lu min OFF\n", 
+          Serial.printf("[Riego] 💧 BOMBA ENCENDIDA - Ciclo %lu min encendido / %lu min apagado\n", 
                        TIEMPO_RIEGO/60000, TIEMPO_DESCANSO/60000);
         } else {
           unsigned long tiempoTranscurrido = currentMillis - cicloStart;
@@ -271,7 +329,7 @@ void RiegoTask(void *pvParameters) {
             Serial.printf("[Riego] 💧 BOMBA ENCENDIDA - Ciclo %lu min\n", TIEMPO_RIEGO/60000);
           }
         }
-      } else if (!dentroHorarioRiego) {
+      } else if (!dentroHorarioRiego && !extemporaneoActivo) {
         if (cicloActivo || bombaEncendida) {
           cicloActivo = false;
           bombaEncendida = false;
@@ -285,17 +343,15 @@ void RiegoTask(void *pvParameters) {
   }
 }
 
+
 // --- Tarea WiFi + NTP SIMPLIFICADA ---
 void WifiTask(void *pvParameters) {
   (void) pvParameters;
 
   pinMode(LED_WIFI_PIN, OUTPUT);
   digitalWrite(LED_WIFI_PIN, LOW);
-
   Serial.println("[WiFi] Iniciando conexión...");
-
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  
   bool conectado = false;
   unsigned long lastReconnectAttempt = 0;
 
@@ -325,7 +381,7 @@ void WifiTask(void *pvParameters) {
           Serial.printf("[NTP] ✅ Hora inicial: %s\n", 
                        formatTime(ultimaHora, ultimoMinuto, ultimoSegundo).c_str());
         } else {
-          Serial.println("[NTP] ⚠️  Falló sincronización inicial");
+          Serial.println("[NTP]  Falló sincronización inicial");
         }
       }
       
@@ -336,7 +392,7 @@ void WifiTask(void *pvParameters) {
         conectado = false;
         wifiConectado = false;
         horaSincronizada = false;
-        Serial.println("[WiFi] ❌ DESCONECTADO");
+        Serial.println("[WiFi]  DESCONECTADO");
       }
       
       // LED parpadeante cuando no hay WiFi
@@ -354,13 +410,11 @@ void WifiTask(void *pvParameters) {
   }
 }
 
-// --- Tarea Telegram (mantener igual) ---
+// --- Tarea Telegram
 void TelegramTask(void *pvParameters) {
   (void) pvParameters;
-
   client.setInsecure();
   Serial.println("[Telegram] Tarea iniciada");
-
   bool primerMensajeEnviado = false;
   unsigned long lastTelegramCheck = 0;
 
@@ -397,10 +451,11 @@ void TelegramTask(void *pvParameters) {
               String chat_id = String(bot.messages[i].chat_id);
               String text = bot.messages[i].text;
 
-              if (chat_id != CHAT_ID) {
+              if (!autorizado(chat_id)) {
                 bot.sendMessage(chat_id, "⛔ Acceso denegado", "");
                 continue;
               }
+
               
               if (text == "/start" || text == "/help") {
                 String welcome = "🌱 *Sistema de Riego Automático* 🤖\n\n";
@@ -409,6 +464,8 @@ void TelegramTask(void *pvParameters) {
                 welcome += "/estado - Estado del sistema\n";
                 welcome += "/abrirvalvula - Abrir válvula (modo manual)\n";
                 welcome += "/cerrarvalvula - Cerrar válvula (modo manual)\n";
+                welcome += "/encenderbomba - encender bomba (modo manual)\n";
+                welcome += "/apagarbomba - apagar bomba (modo manual)\n";
                 welcome += "/config - Configuración actual\n";
                 welcome += "/help - Ayuda";
                 bot.sendMessage(chat_id, welcome, "Markdown");
@@ -426,8 +483,6 @@ void TelegramTask(void *pvParameters) {
                 estado += "🔌 *Bomba:* " + String(bombaEncendida ? "✅ ENCENDIDA" : "❌ APAGADA") + "\n";
                 estado += "🚰 *Válvula:* " + String((digitalRead(RELAY_VALVULA) == LOW) ? "✅ ABIERTA" : "❌ CERRADA");
                 estado += String(valvulaManual ? " (MANUAL)" : " (AUTO)") + "\n";
-                estado += "📡 *WiFi:* " + String(wifiConectado ? "✅ CONECTADO" : "❌ DESCONECTADO") + "\n\n";
-                estado += "💡 *Modo:* Riego SIN verificación de nivel";
                 bot.sendMessage(chat_id, estado, "Markdown");
               }
               else if (text == "/abrirvalvula") {
@@ -440,42 +495,21 @@ void TelegramTask(void *pvParameters) {
                 digitalWrite(RELAY_VALVULA, HIGH);
                 valvulaManual = false;
                 llenandoTanque = false;
-                bot.sendMessage(chat_id, "❌ *Válvula cerrada - Modo AUTOMÁTICO activado*", "Markdown");
+                bot.sendMessage(chat_id, " *Válvula cerrada - Modo AUTOMÁTICO activado*", "Markdown");
               }
-              else if (text == "/ciclo") {
-                String ciclo = "⏱️ *Configurar Ciclo de Riego*\n\n";
-                ciclo += "Actual: " + String(TIEMPO_RIEGO/60000) + "min ON / " + String(TIEMPO_DESCANSO/60000) + "min OFF\n\n";
-                ciclo += "Usa:\n";
-                ciclo += "/ciclo_3_5 - 3min ON / 5min OFF\n";
-                ciclo += "/ciclo_5_10 - 5min ON / 10min OFF\n";
-                ciclo += "/ciclo_10_20 - 10min ON / 20min OFF\n";
-                ciclo += "/ciclo_1_2 - 1min ON / 2min OFF";
-                bot.sendMessage(chat_id, ciclo, "Markdown");
+              else if (text == "/encenderbomba") {
+                digitalWrite(RELAY_BOMBA, LOW);
+                bombaManual = true;
+                bombaEncendida = true;
+                bot.sendMessage(chat_id, " *Bomba abierta en modo MANUAL*\n\nSe mantendrá abierta hasta que uses /apagarbomba", "Markdown");
               }
-              else if (text == "/ciclo_3_5") {
-                TIEMPO_RIEGO = 3 * 60 * 1000;
-                TIEMPO_DESCANSO = 5 * 60 * 1000;
-                cicloActivo = false; // Reiniciar ciclo
-                bot.sendMessage(chat_id, "✅ *Ciclo configurado:* 3min ON / 5min OFF\n\nCiclo reiniciado", "Markdown");
+              else if (text == "/apagarbomba") {
+                digitalWrite(RELAY_BOMBA, HIGH);
+                bombaManual = false;
+                bombaEncendida = false;
+                bot.sendMessage(chat_id, " *BOMBA APAGADA*\n\nModo AUTOMÁTICO restaurado", "Markdown");
               }
-              else if (text == "/ciclo_5_10") {
-                TIEMPO_RIEGO = 5 * 60 * 1000;
-                TIEMPO_DESCANSO = 10 * 60 * 1000;
-                cicloActivo = false;
-                bot.sendMessage(chat_id, "✅ *Ciclo configurado:* 5min ON / 10min OFF\n\nCiclo reiniciado", "Markdown");
-              }
-              else if (text == "/ciclo_10_20") {
-                TIEMPO_RIEGO = 10 * 60 * 1000;
-                TIEMPO_DESCANSO = 20 * 60 * 1000;
-                cicloActivo = false;
-                bot.sendMessage(chat_id, "✅ *Ciclo configurado:* 10min ON / 20min OFF\n\nCiclo reiniciado", "Markdown");
-              }
-              else if (text == "/ciclo_1_2") {
-                TIEMPO_RIEGO = 1 * 60 * 1000;
-                TIEMPO_DESCANSO = 2 * 60 * 1000;
-                cicloActivo = false;
-                bot.sendMessage(chat_id, "✅ *Ciclo configurado:* 1min ON / 2min OFF\n\nCiclo reiniciado", "Markdown");
-              }
+             
               else if (text == "/config") {
                 String config = "⚙️ *CONFIGURACIÓN ACTUAL*\n\n";
                 config += "🕒 *Horario Riego:* " + String(HORA_INICIO_RIEGO) + ":00 - " + String(HORA_FIN_RIEGO) + ":00\n";
