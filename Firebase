@@ -1,0 +1,612 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include "DHT.h"
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+//#include <FirebaseClient.h>
+
+// =================== CONFIGURACIÓN ===================
+#define WIFI_SSID     "CORAZON"
+#define WIFI_PASSWORD "21624381rmg"
+// Pines sensores y actuadores
+#define PH_PIN            33
+#define SOIL_PIN          32
+#define LED_WIFI_PIN      12
+#define DHT_PIN           4
+#define NIVEL_PIN         17
+#define RELAY_BOMBA       18
+#define RELAY_VALVULA     5
+
+// DHT
+#define DHTTYPE DHT22
+DHT dht(DHT_PIN, DHTTYPE);
+
+// =================== TELEGRAM ===================
+
+#define BOT_TOKEN "8455839717:AAHnAR2C6LH_YLYbgEUoCTqUm8qy4YPD7C8"
+#define CHAT_ID "7162242048"
+// Lista de usuarios autorizados
+const char* CHAT_IDS[] = {"1595976531", "7162242048"};  // agrega los que quieras
+const int NUM_CHAT_IDS = 2;  // cantidad de IDs
+
+
+WiFiClientSecure client;
+UniversalTelegramBot bot(BOT_TOKEN, client);
+/*
+//fire-base
+#define ENABLE_USER_AUTH
+#define ENABLE_DATABASE 
+#define ENABLE_NETWORK_WIFI
+#define ENABLE_HTTP_CLIENT
+#define ENABLE_SSL_CLIENT
+
+#include <FirebaseClient.h>
+
+#define API_KEY       "sQsNmIltaCKyp1B4VQXKipkdU2IleLFxDjeWdtC0"
+#define DATABASE_URL  "https://cultivo-hidro-default-rtdb.firebaseio.com/" 
+
+// Objetos de Firebase (modernos)
+WiFiClientSecure ssl_client;
+AsyncClientClass aClient(ssl_client);
+FirebaseApp app;
+FirebaseClient firebaseClient;
+RealtimeDatabase database;
+user_auth_data authData; */
+
+// =================== RTOS ===================
+#define RTOS_DELAY(ms) vTaskDelay((ms) / portTICK_PERIOD_MS)
+
+TaskHandle_t TaskSensorsHandle = NULL;
+TaskHandle_t TaskRiegoHandle   = NULL;
+TaskHandle_t TaskWifiHandle    = NULL;
+TaskHandle_t TaskTelegramHandle = NULL;
+
+// =================== WIFI + NTP SIMPLIFICADO ===================
+WiFiUDP ntpUDP;
+// Servidor NTP confiable para Colombia
+
+NTPClient timeClient(ntpUDP, "time.nist.gov", -5 * 3600, 60000);
+
+// =================== VARIABLES GLOBALES ===================
+volatile float lastPH = 0.0;
+volatile int lastSoil = 0;
+volatile float lastTemp = 0.0;
+volatile float lastHum = 0.0;
+volatile bool nivelAguaOK = false;
+volatile bool wifiConectado = false;
+
+// Control de sistema
+volatile bool cicloActivo = false;
+volatile unsigned long cicloStart = 0;
+volatile bool bombaEncendida = false;
+volatile bool llenandoTanque = false;
+volatile bool valvulaManual = false;
+volatile bool bombaManual = false;
+
+// Control de tiempo MEJORADO - SIMPLIFICADO
+volatile unsigned long ultimaHoraSincronizada = 0;
+volatile int ultimaHora = 7;
+volatile int ultimoMinuto = 0;
+volatile int ultimoSegundo = 0;
+volatile bool horaSincronizada = false;
+
+// Configuraciones del usuario
+volatile unsigned long TIEMPO_RIEGO = 10 * 60 * 1000;    // 10 minutos
+volatile unsigned long TIEMPO_DESCANSO = 8 * 60 * 1000;  // 8 minutos
+volatile int HORA_INICIO_RIEGO = 7;
+volatile int HORA_FIN_RIEGO = 17;
+volatile int HORA_INICIO_LLENADO = 18;
+volatile int HORA_FIN_LLENADO = 6;
+volatile int HORA_ext_ini1 = 21;
+volatile int HORA_ext_ini2 = 3;
+volatile int HORA_ext_ini3 = 23;
+volatile bool MEDIR_PH = true;
+
+// sensor de humedad del suelo
+volatile int SOIL_WET_VALUE = 1200;
+volatile int SOIL_DRY_VALUE = 4095;
+volatile int lastSoilPercent = 0;
+
+// =================== TAREAS ===================
+
+String formatTime(int hours, int minutes, int seconds) {
+  String h = hours < 10 ? "0" + String(hours) : String(hours);
+  String m = minutes < 10 ? "0" + String(minutes) : String(minutes);
+  String s = seconds < 10 ? "0" + String(seconds) : String(seconds);
+  return h + ":" + m + ":" + s;
+}
+//autorización de usuarios
+bool autorizado(String id) {
+  for (int i = 0; i < NUM_CHAT_IDS; i++) {
+    if (id == CHAT_IDS[i]) return true;
+  }
+  return false;
+}
+
+
+// Función SIMPLIFICADA para obtener hora actual
+void obtenerHoraActual(int &hora, int &minuto, int &segundo) {
+  if (wifiConectado) {
+    // Intentar actualizar hora NTP cada 30 minutos
+    if (!horaSincronizada || (millis() - ultimaHoraSincronizada > 30 * 60 * 1000)) {
+      if (timeClient.update()) {
+        hora = timeClient.getHours();
+        minuto = timeClient.getMinutes();
+        segundo = timeClient.getSeconds();
+        
+        // Guardar última hora sincronizada
+        ultimaHora = hora;
+        ultimoMinuto = minuto;
+        ultimoSegundo = segundo;
+        ultimaHoraSincronizada = millis();
+        horaSincronizada = true;
+        
+        Serial.printf("[NTP] Hora sincronizada: %s\n", formatTime(hora, minuto, segundo).c_str());
+        return;
+      } else {
+        Serial.println("[NTP] Falló sincronización, usando hora local");
+      }
+    } else {
+      // Usar hora NTP ya sincronizada
+      hora = timeClient.getHours();
+      minuto = timeClient.getMinutes();
+      segundo = timeClient.getSeconds();
+      return;
+    }
+  }
+  
+  // FALLBACK: calcular hora basada en última sincronización
+  unsigned long tiempoTranscurrido = millis() - ultimaHoraSincronizada;
+  unsigned long segundosTotales = (ultimaHora * 3600UL) + (ultimoMinuto * 60UL) + ultimoSegundo;
+  segundosTotales += (tiempoTranscurrido / 1000);
+  
+  hora = (segundosTotales / 3600) % 24;
+  minuto = (segundosTotales % 3600) / 60;
+  segundo = segundosTotales % 60;
+}
+
+// --- Tarea de Sensores ---
+void SensoresTask(void *pvParameters) {
+  (void) pvParameters;
+
+  pinMode(PH_PIN, INPUT);
+  pinMode(SOIL_PIN, INPUT);
+  pinMode(NIVEL_PIN, INPUT_PULLUP);
+
+  dht.begin();
+  
+  Serial.println("[Sensores] Tarea iniciada");
+
+  unsigned long lastSensorRead = 0;
+  unsigned long lastPrint = 0;
+
+  for (;;) {
+    unsigned long currentMillis = millis();
+    
+    // Leer sensores cada 2 segundos
+    if (currentMillis - lastSensorRead >= 2000) {
+      lastSensorRead = currentMillis;
+      
+      // Leer sensor de nivel
+      bool nivelLeido = (digitalRead(NIVEL_PIN) == LOW);
+      if (nivelLeido != nivelAguaOK) {
+        nivelAguaOK = nivelLeido;
+        Serial.printf("[Sensores] Nivel agua: %s\n", nivelAguaOK ? "OK" : "BAJO");
+      }
+
+      // Leer humedad suelo
+      int soilRaw = analogRead(SOIL_PIN);
+      int soilPercent = map(soilRaw, SOIL_DRY_VALUE, SOIL_WET_VALUE, 0, 100);
+      soilPercent = constrain(soilPercent, 0, 100);
+      
+      if (soilPercent != lastSoilPercent) {
+        lastSoilPercent = soilPercent;
+        lastSoil = soilRaw;
+      }
+
+      // Leer DHT22
+      float temp = dht.readTemperature();
+      float hum = dht.readHumidity();
+      
+      if (!isnan(temp)) lastTemp = temp;
+      if (!isnan(hum)) lastHum = hum;
+
+      // Leer pH
+      if (MEDIR_PH) {
+        int phRaw = analogRead(PH_PIN);
+        float voltage = phRaw * (3.3 / 4095.0);
+        lastPH = 7.0 + ((voltage - 2.5) / 0.18);
+      }
+    }
+
+    // Debug cada 10 segundos
+    if (currentMillis - lastPrint >= 10000) {
+      lastPrint = currentMillis;
+      
+      int hora, minuto, segundo;
+      obtenerHoraActual(hora, minuto, segundo);
+      String timestamp = formatTime(hora, minuto, segundo);
+      
+      String modo = wifiConectado ? "" : " [SIN WIFI]";
+      String ntpStatus = horaSincronizada ? " [NTP OK]" : " [HORA LOCAL]";
+      
+      Serial.printf("[%s] pH=%.2f, Humedad=%d%%, Temp=%.1f°C, HumAire=%.1f%%, Nivel=%s%s%s\n",
+              timestamp.c_str(), lastPH, lastSoilPercent, 
+              lastTemp, lastHum, nivelAguaOK ? "OK" : "BAJO", modo.c_str(), ntpStatus.c_str());
+    }
+
+    RTOS_DELAY(500);
+  }
+}
+
+// --- Tarea de Riego --- 
+void RiegoTask(void *pvParameters) {
+  (void) pvParameters;
+
+  pinMode(RELAY_BOMBA, OUTPUT);
+  pinMode(RELAY_VALVULA, OUTPUT);
+
+  digitalWrite(RELAY_BOMBA, HIGH);
+  digitalWrite(RELAY_VALVULA, HIGH);
+
+  Serial.println("[Riego] Tarea iniciada - Control automático de bomba");
+
+  unsigned long lastControlTime = 0;
+
+  // Variables para control de riegos extemporáneos
+  unsigned long inicioExtemporaneo = 0;
+  bool extemporaneoActivo = false;
+  bool extemporaneoRealizado[3] = {false, false, false};
+  const unsigned long DURACION_EXTEMPORANEO = 4 * 60 * 1000; // 4 minutos
+
+  for (;;) {
+    unsigned long currentMillis = millis();
+    
+    // Control cada 2 segundos
+    if (currentMillis - lastControlTime >= 2000) {
+      lastControlTime = currentMillis;
+      
+      int horaActual, minutoActual, segundoActual;
+      obtenerHoraActual(horaActual, minutoActual, segundoActual);
+
+      // === RESETEAR MARCAS DE RIEGOS EXTRA A MEDIA NOCHE ===
+      if (horaActual == 0 && minutoActual == 0 && segundoActual < 5) {
+        for (int i = 0; i < 3; i++) extemporaneoRealizado[i] = false;
+      }
+      // Si está en modo manual, saltar control automático
+      if (bombaManual) {
+      
+      continue;
+      }
+      // === CONTROL DE VÁLVULA ===
+      if (!valvulaManual) {
+        bool dentroHorarioLlenado = (horaActual >= HORA_INICIO_LLENADO || horaActual < HORA_FIN_LLENADO);
+
+        if (dentroHorarioLlenado && !nivelAguaOK && !llenandoTanque) {
+          Serial.println("[Riego] Iniciando llenado automático");
+          llenandoTanque = true;
+          digitalWrite(RELAY_VALVULA, LOW);
+        }
+        
+        if (llenandoTanque && (nivelAguaOK || !dentroHorarioLlenado)) {
+          Serial.println("[Riego] Deteniendo llenado automático");
+          digitalWrite(RELAY_VALVULA, HIGH);
+          llenandoTanque = false;
+        }
+      }
+
+      // === CONTROL DE RIEGOS EXTEMPORÁNEOS ===
+      int horasExt[3] = {HORA_ext_ini1, HORA_ext_ini2, HORA_ext_ini3};
+
+      for (int i = 0; i < 3; i++) {
+        // Si estamos dentro del minuto exacto de inicio y aún no se hizo hoy
+        if (!extemporaneoRealizado[i] && horaActual == horasExt[i] && minutoActual == 0) {
+          Serial.printf("[Riego] 💦 Iniciando riego extemporáneo %d a las %02d:00\n", i+1, horasExt[i]);
+          extemporaneoActivo = true;
+          inicioExtemporaneo = currentMillis;
+          bombaEncendida = true;
+          digitalWrite(RELAY_BOMBA, LOW);
+          extemporaneoRealizado[i] = true;
+        }
+      }
+
+      // Si está activo, controlar duración de 4 minutos
+      if (extemporaneoActivo) {
+        if (currentMillis - inicioExtemporaneo >= DURACION_EXTEMPORANEO) {
+          extemporaneoActivo = false;
+          bombaEncendida = false;
+          digitalWrite(RELAY_BOMBA, HIGH);
+          Serial.println("[Riego] 💧 Riego extemporáneo finalizado");
+        }
+      }
+
+      // === SISTEMA DE RIEGO PRINCIPAL ===
+      bool dentroHorarioRiego = (horaActual >= HORA_INICIO_RIEGO && horaActual < HORA_FIN_RIEGO);
+      
+      if (dentroHorarioRiego && !extemporaneoActivo) {  // Evitar conflicto
+        if (!cicloActivo) {
+          cicloActivo = true;
+          bombaEncendida = true;
+          cicloStart = currentMillis;
+          digitalWrite(RELAY_BOMBA, LOW);
+          Serial.printf("[Riego] 💧 BOMBA ENCENDIDA - Ciclo %lu min encendido / %lu min apagado\n", 
+                       TIEMPO_RIEGO/60000, TIEMPO_DESCANSO/60000);
+        } else {
+          unsigned long tiempoTranscurrido = currentMillis - cicloStart;
+          
+          if (bombaEncendida && tiempoTranscurrido >= TIEMPO_RIEGO) {
+            bombaEncendida = false;
+            cicloStart = currentMillis;
+            digitalWrite(RELAY_BOMBA, HIGH);
+            Serial.printf("[Riego] 💧 Bomba APAGADA - Descanso %lu min\n", TIEMPO_DESCANSO/60000);
+          } else if (!bombaEncendida && tiempoTranscurrido >= TIEMPO_DESCANSO) {
+            bombaEncendida = true;
+            cicloStart = currentMillis;
+            digitalWrite(RELAY_BOMBA, LOW);
+            Serial.printf("[Riego] 💧 BOMBA ENCENDIDA - Ciclo %lu min\n", TIEMPO_RIEGO/60000);
+          }
+        }
+      } else if (!dentroHorarioRiego && !extemporaneoActivo) {
+        if (cicloActivo || bombaEncendida) {
+          cicloActivo = false;
+          bombaEncendida = false;
+          digitalWrite(RELAY_BOMBA, HIGH);
+          Serial.println("[Riego] 💧 Riego DETENIDO - Fuera de horario");
+        }
+      }
+    }
+
+    RTOS_DELAY(500);
+  }
+}
+
+
+// --- Tarea WiFi + NTP SIMPLIFICADA ---
+void WifiTask(void *pvParameters) {
+  (void) pvParameters;
+
+  pinMode(LED_WIFI_PIN, OUTPUT);
+  digitalWrite(LED_WIFI_PIN, LOW);
+  Serial.println("[WiFi] Iniciando conexión...");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  bool conectado = false;
+  unsigned long lastReconnectAttempt = 0;
+
+  for (;;) {
+    unsigned long currentMillis = millis();
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      if (!conectado) {
+        conectado = true;
+        wifiConectado = true;
+        digitalWrite(LED_WIFI_PIN, HIGH);
+        Serial.println("[WiFi] ✅ CONECTADO");
+        Serial.print("[WiFi] IP: ");
+        Serial.println(WiFi.localIP());
+        
+        // INICIALIZACIÓN SIMPLE DEL NTP
+        timeClient.begin();
+        RTOS_DELAY(1000);
+        
+        // Sincronizar hora inicial
+        if (timeClient.update()) {
+          ultimaHora = timeClient.getHours();
+          ultimoMinuto = timeClient.getMinutes();
+          ultimoSegundo = timeClient.getSeconds();
+          ultimaHoraSincronizada = currentMillis;
+          horaSincronizada = true;
+          Serial.printf("[NTP] ✅ Hora inicial: %s\n", 
+                       formatTime(ultimaHora, ultimoMinuto, ultimoSegundo).c_str());
+        } else {
+          Serial.println("[NTP]  Falló sincronización inicial");
+        }
+      }
+      
+      digitalWrite(LED_WIFI_PIN, HIGH);
+      
+    } else {
+      if (conectado) {
+        conectado = false;
+        wifiConectado = false;
+        horaSincronizada = false;
+        Serial.println("[WiFi]  DESCONECTADO");
+      }
+      
+      // LED parpadeante cuando no hay WiFi
+      digitalWrite(LED_WIFI_PIN, (currentMillis % 2000 < 1000) ? HIGH : LOW);
+      
+      if (currentMillis - lastReconnectAttempt >= 30000) {
+        Serial.println("[WiFi] 🔄 Intentando reconectar...");
+        WiFi.disconnect();
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+        lastReconnectAttempt = currentMillis;
+      }
+    }
+
+    RTOS_DELAY(1000);
+  }
+}
+
+// --- Tarea Telegram
+void TelegramTask(void *pvParameters) {
+  (void) pvParameters;
+  client.setInsecure();
+  Serial.println("[Telegram] Tarea iniciada");
+  bool primerMensajeEnviado = false;
+  unsigned long lastTelegramCheck = 0;
+
+  for (;;) {
+    unsigned long currentMillis = millis();
+    
+    if (wifiConectado) {
+      if (!primerMensajeEnviado) {
+        String ip = WiFi.localIP().toString();
+        String mensaje = "🤖 *Sistema de Riego Conectado!* 🌱\n\n";
+        mensaje += "📡 IP: " + ip + "\n";
+        mensaje += "🇨🇴 *Zona Horaria:* Colombia (UTC-5)\n";
+        mensaje += "⏰ *Hora Sistema:* " + formatTime(ultimaHora, ultimoMinuto, ultimoSegundo) + "\n";
+        mensaje += "💧 *Modo:* Riego automático \n";
+        mensaje += "⏱️ *Ciclo:* " + String(TIEMPO_RIEGO/60000) + "min ON / " + String(TIEMPO_DESCANSO/60000) + "min OFF\n\n";
+        mensaje += "Usa /help para ver comandos";
+        
+        bot.sendMessage(CHAT_ID, mensaje, "Markdown");
+        primerMensajeEnviado = true;
+        Serial.println("[Telegram] Mensaje de bienvenida enviado");
+      }
+
+      // Revisar Telegram cada 3 segundos
+      if (currentMillis - lastTelegramCheck >= 3000) {
+        lastTelegramCheck = currentMillis;
+        
+        try {
+          int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+          
+          if (numNewMessages > 0) {
+             Serial.printf("[Telegram] %d mensajes nuevos\n", numNewMessages);
+            
+            for (int i = 0; i < numNewMessages; i++) {
+              String chat_id = String(bot.messages[i].chat_id);
+              String text = bot.messages[i].text;
+
+              if (!autorizado(chat_id)) {
+                bot.sendMessage(chat_id, "⛔ Acceso denegado", "");
+                continue;
+              }
+
+              
+              if (text == "/start" || text == "/help") {
+                String welcome = "🌱 *Sistema de Riego Automático* 🤖\n\n";
+                welcome += "💧 *MODO ESPECIAL:* Riego \n\n";
+                welcome += "📋 *Comandos:*\n";
+                welcome += "/estado - Estado del sistema\n";
+                welcome += "/abrirvalvula - Abrir válvula (modo manual)\n";
+                welcome += "/cerrarvalvula - Cerrar válvula (modo manual)\n";
+                welcome += "/encenderbomba - encender bomba (modo manual)\n";
+                welcome += "/apagarbomba - apagar bomba (modo manual)\n";
+                welcome += "/config - Configuración actual\n";
+                welcome += "/help - Ayuda";
+                bot.sendMessage(chat_id, welcome, "Markdown");
+              }
+              else if (text == "/estado") {
+                int hora, minuto, segundo;
+                obtenerHoraActual(hora, minuto, segundo);
+                String estado = "📊 *ESTADO DEL SISTEMA*\n";
+                estado += "⏰ " + formatTime(hora, minuto, segundo) + "\n\n";
+                estado += "💧 *Humedad de la Raiz:* " + String(lastSoilPercent) + "%\n";
+                estado += "🌡️ *Temperatura:* " + String(lastTemp, 1) + "°C\n";
+                estado += "💦 *Humedad Aire:* " + String(lastHum, 1) + "%\n";
+                estado += "🧪 *pH:* " + String(lastPH, 2) + "\n";
+                estado += "💧 *Nivel Agua:* " + String(nivelAguaOK ? "✅ OK" : "⚠️ BAJO") + "\n";
+                estado += "🔌 *Bomba:* " + String(bombaEncendida ? "✅ ENCENDIDA" : "❌ APAGADA");
+                estado += String(bombaManual ? " (MANUAL)" : " (AUTO)") + "\n";
+                estado += "🚰 *Válvula:* " + String((digitalRead(RELAY_VALVULA) == LOW) ? "✅ ABIERTA" : "❌ CERRADA");
+                estado += String(valvulaManual ? " (MANUAL)" : " (AUTO)") + "\n";
+                bot.sendMessage(chat_id, estado, "Markdown");
+              }
+              else if (text == "/abrirvalvula") {
+                digitalWrite(RELAY_VALVULA, LOW);
+                valvulaManual = true;
+                llenandoTanque = true;
+                bot.sendMessage(chat_id, "✅ *Válvula abierta en modo MANUAL*\n\nSe mantendrá abierta hasta que uses /cerrarvalvula", "Markdown");
+              }
+              else if (text == "/cerrarvalvula") {
+                digitalWrite(RELAY_VALVULA, HIGH);
+                valvulaManual = false;
+                llenandoTanque = false;
+                bot.sendMessage(chat_id, " *Válvula cerrada - Modo AUTOMÁTICO activado*", "Markdown");
+              }
+              else if (text == "/encenderbomba") {
+                digitalWrite(RELAY_BOMBA, LOW);
+                bombaManual = true;
+                bombaEncendida = true;
+                bot.sendMessage(chat_id, " *Bomba abierta en modo MANUAL*\n\nSe mantendrá abierta hasta que uses /apagarbomba", "Markdown");
+              }
+              else if (text == "/apagarbomba") {
+                digitalWrite(RELAY_BOMBA, HIGH);
+                bombaManual = false;
+                bombaEncendida = false;
+                bot.sendMessage(chat_id, " *BOMBA APAGADA*\n\nModo AUTOMÁTICO restaurado", "Markdown");
+              }
+             
+              else if (text == "/config") {
+                String config = "⚙️ *CONFIGURACIÓN ACTUAL*\n\n";
+                config += "🕒 *Horario Riego:* " + String(HORA_INICIO_RIEGO) + ":00 - " + String(HORA_FIN_RIEGO) + ":00\n";
+                config += "💧 *Horario Llenado:* " + String(HORA_INICIO_LLENADO) + ":00 - " + String(HORA_FIN_LLENADO) + ":00\n";
+                config += "⏱️ *Ciclo Riego:* " + String(TIEMPO_RIEGO/60000) + "min ON / " + String(TIEMPO_DESCANSO/60000) + "min OFF\n";
+                config += "💡 *MODO ESPECIAL:* Riego SIN verificación de nivel\n";
+                config += "🚰 *Modo Bomba:* " + String(bombaManual ? "MANUAL" : "AUTOMÁTICO");
+                config += "🚰 *Modo Válvula:* " + String(valvulaManual ? "MANUAL" : "AUTOMÁTICO");
+                bot.sendMessage(chat_id, config, "Markdown");
+              }
+            }
+          
+            
+          }
+        } catch (...) {
+          Serial.println("[Telegram] Error temporal");
+        }
+      }
+    } else {
+      primerMensajeEnviado = false;
+    }
+
+    RTOS_DELAY(1000);
+  }
+}
+
+// =================== SETUP ===================
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+  
+  Serial.println("\n" + String(80, '='));
+  Serial.println("🌱 SISTEMA DE RIEGO + TELEGRAM 🤖");
+  Serial.println("🇨🇴 Zona Horaria: Colombia (UTC-5)");
+  Serial.println("💧 MODO: Riego automático");
+  Serial.println("⏱️  Ciclo: " + String(TIEMPO_RIEGO/60000) + "min ON / " + String(TIEMPO_DESCANSO/60000) + "min OFF");
+  Serial.println(String(80, '='));
+
+  // Inicializar tiempo por defecto
+  ultimaHora = HORA_INICIO_RIEGO;
+  ultimoMinuto = 0;
+  ultimoSegundo = 0;
+  ultimaHoraSincronizada = millis();
+
+  // Configurar pines
+  pinMode(RELAY_BOMBA, OUTPUT);
+  pinMode(RELAY_VALVULA, OUTPUT);
+  pinMode(LED_WIFI_PIN, OUTPUT);
+  digitalWrite(RELAY_BOMBA, HIGH);
+  digitalWrite(RELAY_VALVULA, HIGH);
+  digitalWrite(LED_WIFI_PIN, LOW);
+
+  dht.begin();
+
+  // Crear tareas
+  xTaskCreatePinnedToCore(SensoresTask, "Sensores", 6144, NULL, 1, &TaskSensorsHandle, 1);
+  xTaskCreatePinnedToCore(RiegoTask, "Riego", 6144, NULL, 2, &TaskRiegoHandle, 1);
+  xTaskCreatePinnedToCore(WifiTask, "WiFi", 6144, NULL, 1, &TaskWifiHandle, 0);
+  xTaskCreatePinnedToCore(TelegramTask, "Telegram", 8192, NULL, 1, &TaskTelegramHandle, 1);
+
+  Serial.println("✅ Sistema iniciado - Riego automático activo");
+}
+
+void loop() {
+  static unsigned long lastStatus = 0;
+  if (millis() - lastStatus > 30000) {
+    int hora, minuto, segundo;
+    obtenerHoraActual(hora, minuto, segundo);
+    Serial.printf("[Sistema] Hora: %s, WiFi: %s, NTP: %s, Bomba: %s, Válvula: %s %s\n", 
+                  formatTime(hora, minuto, segundo).c_str(),
+                  wifiConectado ? "OK" : "NO",
+                  horaSincronizada ? "OK" : "LOCAL", 
+                  bombaEncendida ? "ON" : "OFF",
+                  (digitalRead(RELAY_VALVULA) == LOW) ? "OPEN" : "CLOSED",
+                  valvulaManual ? "(MANUAL)" : "(AUTO)");
+    lastStatus = millis();
+  }
+  
+  RTOS_DELAY(5000);
+}
