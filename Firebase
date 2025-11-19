@@ -42,13 +42,7 @@ const unsigned long FIREBASE_INTERVAL = 60000; // 1 minuto
 DHT dht(DHT_PIN, DHTTYPE);
 
 // =================== TELEGRAM ===================
-#define BOT_TOKEN "8455839717:AAHnAR2C6LH_YLYbgEUoCTqUm8qy4YPD7C8"
-#define CHAT_ID "1595976531"
 
-// Lista de usuarios autorizados
-//const char* CHAT_IDS[] = {"1595976531", "7162242048"}; //real
-const char* CHAT_IDS[] = {"1595976531"};//prueba
-const int NUM_CHAT_IDS = 1;
 
 WiFiClientSecure client;
 UniversalTelegramBot bot(BOT_TOKEN, client);
