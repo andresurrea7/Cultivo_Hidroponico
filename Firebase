@@ -11,10 +11,7 @@
 #define ENABLE_DATABASE
 #include <FirebaseClient.h>
 
-#define FIREBASE_URL "https://cultivo-hidro-default-rtdb.firebaseio.com/"
-#define FIREBASE_EMAIL "cultivohidro759@gmail.com"
-#define FIREBASE_PASSWORD "3148860071h"
-#define FIREBASE_API_KEY "AIzaSyAMBLi6pqFIEx6uOP4wRgfZtVtM49DxDek"
+
 
 // Objetos Firebase
 WiFiClientSecure ssl_client;
